@@ -2,12 +2,13 @@ import os, sys
 import json
 import urllib.request
 from http.client import HTTPResponse
-import html
-import xml
 from html.parser import HTMLParser
 from html.entities import name2codepoint
+import traceback
+import logging
+logging.root.setLevel(logging.CRITICAL)
 
-c_filename_kv = "tianya.json"  # 记录单独板块
+c_filename_data = "data.json"  # 记录单独板块
 c_filename_blocks = "tianya_blocks.json"  # 记录所有的板块，包括子级别
 
 c_htmlstr = """
@@ -2465,6 +2466,8 @@ class TYHTMLParser(HTMLParser):
     self.countReplies = None
     self.startAt = None
     self.desc = None
+    self.bbsGlobal = None
+
     self.attrs = None  # 当前tag的attrs
     self.nextIsStartAt = False  # 标记下一个Data是开版时间
     self.nextIsDesc = False
@@ -2475,7 +2478,7 @@ class TYHTMLParser(HTMLParser):
 
   def handle_starttag(self, tag, attrs):
 
-    print("Start tag:", tag)
+    logging.debug("Start tag:"+ tag)
     self.attrs = dict(attrs)
     if 'id' in self.attrs and self.attrs['id'] == 'main_xiangguan':
       self.xiangguanStart = True
@@ -2488,20 +2491,20 @@ class TYHTMLParser(HTMLParser):
         self.xiangguanBlocks.append(href_abs)
 
     for attr in attrs:
-      print("     attr:", attr)
+      logging.debug("     attr:"+ str(attr))
 
   def handle_endtag(self, tag):
     self.attrs = None
-    print("End tag  :", tag)
+    logging.debug("End tag  :"+ tag)
 
     if self.xiangguanStart:
       self.openingTagCount -= 1
-      print("openingTagCount=", self.openingTagCount)
+      logging.debug("openingTagCount=", self.openingTagCount)
       if self.openingTagCount == 0:
         self.xiangguanStart = False
 
   def handle_data(self, data):
-    print("Data     :", data)
+    logging.debug("Data     :"+ data)
 
     if self.nextIsStartAt:
       self.startAt = data
@@ -2521,26 +2524,34 @@ class TYHTMLParser(HTMLParser):
       self.nextIsStartAt = True
     elif '本版介绍：' == data:
       self.nextIsDesc = True
+    elif 'bbsGlobal' in data:
+      left = data.index('{')
+      right = data.index('}')
+      bbsGlobal = data[left:right+1]
+      bbsGlobal = bbsGlobal.replace("\t",'"')
+      bbsGlobal = bbsGlobal.replace(" :",'":')
+      self.bbsGlobal = json.loads(bbsGlobal)
+      print("bbsGlobal:",bbsGlobal)
     else:
       self.nextIsStartAt = False
       self.nextIsDesc = False
 
   def handle_comment(self, data):
-    print("Comment  :", data)
+    logging.debug("Comment  :"+ data)
 
   def handle_entityref(self, name):
     c = chr(name2codepoint[name])
-    print("Named ent:", c)
+    logging.debug("Named ent:"+ c)
 
   def handle_charref(self, name):
     if name.startswith('x'):
       c = chr(int(name[1:], 16))
     else:
       c = chr(int(name))
-    print("Num ent  :", c)
+      logging.debug("Num ent  :"+ c)
 
   def handle_decl(self, data):
-    print("Decl     :", data)
+    logging.debug("Decl     :"+ data)
 
 
 class TianYa:
@@ -2548,7 +2559,7 @@ class TianYa:
     pass
 
   def saveTo_tianya_blocks(self, block, upperBlock=None):
-    """block是板块网址，upperBlock上级板块网址"""
+    """block是板块网址，upperBlock上级板块网址。最多只有两级"""
     if not os.path.exists(c_filename_blocks):
       with open(c_filename_blocks, "w") as f:
         json.dump({"": ""}, f)
@@ -2558,37 +2569,77 @@ class TianYa:
     if upperBlock is None:
       d[block] = {}
     else:
-      d[upperBlock][block] = {}
+      d[upperBlock][block] = None
 
     with open(c_filename_blocks, "w") as f:
       json.dump(d, f, indent=4)
 
-  def getInfoOfBlock(self, block):
-    """						<span title="940580">主帖数：94万</span>
-						<span title="18748494">回帖数：1874万</span>"""
-    response: HTTPResponse = urllib.request.urlopen(block)
-    htmlstr = response.read()
+  def getBlocks(self)->dict:
+    """读取json"""
+    with open(c_filename_blocks, "r") as f:
+      d = json.load(f)
+      return d
+
+  def fetchInfoOfBlock(self, block, isSubBlock):
+    """获取版块信息，获取后更新两个json文件"""
+    logging.critical("will fetch "+ block)
+    if self.isBlockAlreadyFetched(block):
+      logging.critical(("已经获取过了 "+ block))
+      return
+    try:
+      response: HTTPResponse = urllib.request.urlopen(block)
+    except:
+      print(f"fetchInfoOfBlock {block} 出错")
+      traceback.print_exc()
+      return
+    htmlstr = response.read().decode()
     parser = TYHTMLParser()
     parser.feed(htmlstr)
+
+    self.saveDataWithBlock(block,parser.countSubject,parser.countReplies,
+                           parser.startAt,parser.desc,parser.bbsGlobal)
+
+    #仅顶层版块处理
+    if not isSubBlock:
+      for subBlock in parser.xiangguanBlocks:
+        self.saveTo_tianya_blocks(subBlock,upperBlock=block)
+
+  def start(self):
+    for block,subBlockDict in self.getBlocks().items():
+      self.fetchInfoOfBlock(block, isSubBlock=False)
+      if len(subBlockDict)>0:
+        for block,_ in subBlockDict.items():
+          self.fetchInfoOfBlock(block, isSubBlock=True)
 
   def getInfoFromHTMLStr(self, htmlstr):
     parser = TYHTMLParser()
     parser.feed(htmlstr)
     print(vars(parser))
 
-  # def saveToJson(self,block,countSubject,countReplies,startAt,desc):
-  #   """一个url，对应主帖数、回帖数、开版时间、本版介绍"""
-  #   if os.path.exists(c_filename):
-  #     with open(c_filename,'r') as f:
-  #       d = json.load(f)
-  #   else:
-  #     d = {}
-  #
-  #   with open(c_filename,'w') as f:
-  #     json.dump(d,f,indent=True)
+  def saveDataWithBlock(self,block,countSubject,countReplies,startAt,desc,bbsGlobal):
+    """将获取到的数据保存到json中。block、对应主帖数、回帖数、开版时间、本版介绍"""
+    if os.path.exists(c_filename_data):
+      with open(c_filename_data,'r') as f:
+        d = json.load(f)
+    else:
+      d = {}
+
+    item = dict(countSubject=countSubject,countReplies=countReplies,
+                startAt=startAt,desc=desc,bbsGlobal=bbsGlobal)
+    d[block] = item
+
+    with open(c_filename_data,'w') as f:
+      json.dump(d,f,indent=4,ensure_ascii=False)
+
+  def isBlockAlreadyFetched(self,block):
+    """看看block是否已经获取过了"""
+    if os.path.exists(c_filename_data):
+      with open(c_filename_data,'r') as f:
+        d = json.load(f)
+        return block in d
+    return False
 
 
 if __name__ == '__main__':
   t = TianYa()
-  a = t.getInfoFromHTMLStr(c_htmlstr)
-  print(a)
+  t.start()
